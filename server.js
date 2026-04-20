@@ -11,25 +11,22 @@ app.use(express.json());
 /* =========================
    🔧 CORS CONFIGURATION
 ========================= */
-console.log("🔧 Loading CORS configuration...");
-
 const allowedOrigins = [
   "http://localhost:5173",
-  "https://pascal-app.onrender.com"
+  "http://localhost:3000",
+  "https://pascal-app.onrender.com",
+  "https://pascal-backend-v2.onrender.com"
 ];
-
-console.log("✅ Allowed origins:", allowedOrigins);
 
 app.use(
   cors({
-    origin: function (origin, callback) {
+    origin: (origin, callback) => {
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        console.log("❌ Blocked by CORS:", origin);
-        callback(new Error("Not allowed by CORS"));
+        return callback(null, true);
       }
+      console.log("❌ Blocked by CORS:", origin);
+      return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
   })
@@ -40,180 +37,357 @@ app.use(
 ========================= */
 const { Pool } = pg;
 
-const pool = new Pool({
+// Check if DATABASE_URL exists
+if (!process.env.DATABASE_URL) {
+  console.error("❌ WARNING: DATABASE_URL environment variable is missing");
+  console.log("📝 App will run with in-memory storage only");
+}
+
+const pool = process.env.DATABASE_URL ? new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
-});
+  ssl: process.env.DATABASE_URL.includes("localhost") 
+    ? false 
+    : { rejectUnauthorized: false },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+}) : null;
 
-pool.connect()
-  .then(() => console.log("✅ Database connected"))
-  .catch((err) => console.error("❌ DB connection error:", err));
+// Database state
+let useDatabase = !!pool;
+let inMemoryHistory = [];
+let dbInitAttempted = false;
 
 /* =========================
-   📦 INIT DATABASE TABLE
+   📦 DATABASE INITIALIZATION
 ========================= */
-const initDB = async () => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS questions (
-        id SERIAL PRIMARY KEY,
-        question TEXT,
-        answer TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log("✅ Database initialized");
-  } catch (err) {
-    console.error("❌ DB INIT ERROR:", err);
+async function initDatabase() {
+  if (!pool) {
+    console.log("📝 No database configured, using in-memory storage");
+    return false;
   }
-};
 
-initDB();
+  if (dbInitAttempted) return useDatabase;
+  dbInitAttempted = true;
+
+  try {
+    // Test connection
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    console.log("✅ Database connected successfully");
+    
+    // Create table if not exists
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS history (
+        id SERIAL PRIMARY KEY,
+        type VARCHAR(50),
+        input TEXT,
+        result JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create index for better performance
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_history_created_at 
+      ON history(created_at DESC)
+    `);
+    
+    client.release();
+    console.log("✅ History table ready");
+    useDatabase = true;
+    return true;
+    
+  } catch (err) {
+    console.error("❌ Database initialization failed:", err.message);
+    console.log("📝 Falling back to in-memory storage");
+    useDatabase = false;
+    return false;
+  }
+}
 
 /* =========================
-   🔢 PASCAL TRIANGLE FUNCTION
+   💾 HISTORY STORAGE WRAPPER
+========================= */
+async function saveToHistory(type, input, result) {
+  if (useDatabase && pool) {
+    try {
+      await pool.query(
+        "INSERT INTO history (type, input, result) VALUES ($1, $2, $3)",
+        [type, input, JSON.stringify(result)]
+      );
+      console.log(`✅ Saved to database: ${type}`);
+      return true;
+    } catch (dbError) {
+      console.error("❌ Database save failed:", dbError.message);
+      useDatabase = false;
+      // Fall through to memory
+    }
+  }
+  
+  // In-memory fallback
+  const historyEntry = {
+    id: inMemoryHistory.length + 1,
+    type,
+    input,
+    result,
+    created_at: new Date().toISOString()
+  };
+  
+  inMemoryHistory.unshift(historyEntry);
+  
+  // Keep only last 100 items
+  if (inMemoryHistory.length > 100) {
+    inMemoryHistory = inMemoryHistory.slice(0, 100);
+  }
+  
+  console.log(`💾 Saved to memory: ${type}`);
+  return true;
+}
+
+async function getHistory(limit = 50) {
+  if (useDatabase && pool) {
+    try {
+      const result = await pool.query(
+        "SELECT * FROM history ORDER BY created_at DESC LIMIT $1",
+        [limit]
+      );
+      return { success: true, storage: "database", data: result.rows };
+    } catch (dbError) {
+      console.error("❌ Database read failed:", dbError.message);
+      useDatabase = false;
+      // Fall through to memory
+    }
+  }
+  
+  // In-memory fallback
+  return { 
+    success: true, 
+    storage: "memory", 
+    data: inMemoryHistory.slice(0, limit) 
+  };
+}
+
+// Initialize database on startup (don't block)
+initDatabase();
+
+/* =========================
+   🔢 PASCAL TRIANGLE
 ========================= */
 function generatePascalTriangle(n) {
-  if (n < 0) throw new Error("n must be non-negative");
-  if (n > 100000) throw new Error("n must be <= 100,000");
-  
   const rows = [];
-  
-  for (let i = 0; i <= n; i++) {
+  const numRows = parseInt(n);
+
+  for (let i = 0; i <= numRows; i++) {
     const row = [];
-    let value = 1;
-    
+    let value = 1n;
+
     for (let j = 0; j <= i; j++) {
-      row.push(value);
-      value = value * (i - j) / (j + 1);
+      row.push(value.toString());
+      value = (value * BigInt(i - j)) / BigInt(j + 1);
     }
-    
+
     rows.push(row);
   }
-  
+
   return rows;
 }
 
 /* =========================
-   📐 BINOMIAL EXPANSION FUNCTION
+   📐 BINOMIAL EXPANSION
 ========================= */
 function parseExpression(expression) {
-  // Pattern: (ax^n + by^m)^p or (ax^n - by^m)^p
-  const pattern = /^\(([+-]?\d*)([a-z])(?:\^(\d+))?([+-])(\d*)([a-z])(?:\^(\d+))?\)\^(\d+)$/i;
-  const match = expression.match(pattern);
-  
+  // Support format: (ax^n + by^m)^p or (ax + by)^p
+  const regex = /^\(([+-]?\d*)([a-z])(?:\^(\d+))?([+-])(\d*)([a-z])(?:\^(\d+))?\)\^(\d+)$/i;
+
+  const match = expression.match(regex);
+
   if (!match) {
-    throw new Error("Invalid format. Use: (ax^n + by^m)^p or (ax^n - by^m)^p");
+    throw new Error("Invalid format. Expected: (ax^n + by^m)^p");
   }
-  
-  const [, coeffAStr, varA, expAStr, operator, coeffBStr, varB, expBStr, powerStr] = match;
-  
-  let coeffA = coeffAStr === '' || coeffAStr === '+' ? 1 : 
-               coeffAStr === '-' ? -1 : parseInt(coeffAStr);
-  let coeffB = coeffBStr === '' || coeffBStr === '+' ? 1 : 
-               coeffBStr === '-' ? -1 : parseInt(coeffBStr);
-  
-  if (operator === '-') coeffB = -coeffB;
-  
-  const powA = expAStr ? parseInt(expAStr) : 1;
-  const powB = expBStr ? parseInt(expBStr) : 1;
-  const p = parseInt(powerStr);
-  
-  if (p < 0 || p > 1000) {
-    throw new Error("Power p must be between 0 and 1000");
-  }
-  
-  return { coeffA, varA, powA, coeffB, varB, powB, p };
+
+  const [, aC, aV, aE, op, bC, bV, bE, p] = match;
+
+  let coeffA = aC === "" || aC === "+" ? 1 : aC === "-" ? -1 : parseInt(aC);
+  let coeffB = bC === "" || bC === "+" ? 1 : bC === "-" ? -1 : parseInt(bC);
+
+  if (op === "-") coeffB = -coeffB;
+
+  return {
+    coeffA,
+    varA: aV,
+    powA: aE ? parseInt(aE) : 1,
+    coeffB,
+    varB: bV,
+    powB: bE ? parseInt(bE) : 1,
+    p: parseInt(p),
+  };
 }
 
 function binomialCoefficient(n, k) {
-  if (k < 0 || k > n) return 0;
-  let result = 1;
+  let res = 1;
   k = Math.min(k, n - k);
+
   for (let i = 1; i <= k; i++) {
-    result = result * (n - k + i) / i;
+    res = (res * (n - k + i)) / i;
   }
-  return Math.round(result);
+
+  return Math.round(res);
 }
 
 function expandBinomial(expression) {
-  const { coeffA, varA, powA, coeffB, varB, powB, p } = parseExpression(expression);
-  
-  if (p === 0) return [{ coeff: 1, powA: 0, powB: 0, varA, varB }];
-  
+  const { coeffA, varA, powA, coeffB, varB, powB, p } =
+    parseExpression(expression);
+
   const terms = [];
-  
+
   for (let k = 0; k <= p; k++) {
     const binom = binomialCoefficient(p, k);
     const coeff = binom * Math.pow(coeffA, p - k) * Math.pow(coeffB, k);
-    
-    if (coeff === 0) continue;
-    
-    const expA = powA * (p - k);
-    const expB = powB * k;
-    
-    terms.push({
-      coeff: coeff,
-      powA: expA,
-      powB: expB,
-      varA: varA,
-      varB: varB
-    });
+
+    const term = {
+      coeff,
+      powA: powA * (p - k),
+      powB: powB * k,
+      varA,
+      varB,
+    };
+
+    terms.push(term);
   }
-  
+
   return terms;
 }
 
 function formatExpansion(terms) {
-  if (terms.length === 0) return "0";
-  
-  return terms.map((term, index) => {
-    let part = "";
-    const absCoeff = Math.abs(term.coeff);
-    
-    if (index === 0) {
-      part += term.coeff < 0 ? "-" : "";
-    } else {
-      part += term.coeff > 0 ? " + " : " - ";
-    }
-    
-    const showCoeff = !(absCoeff === 1 && (term.powA > 0 || term.powB > 0));
-    
-    if (showCoeff && absCoeff !== 1) {
-      part += absCoeff;
-    } else if (absCoeff === 1 && term.powA === 0 && term.powB === 0) {
-      part += "1";
-    }
-    
-    if (term.powA > 0) {
-      part += term.varA;
-      if (term.powA > 1) part += `^${term.powA}`;
-    }
-    
-    if (term.powB > 0) {
-      part += term.varB;
-      if (term.powB > 1) part += `^${term.powB}`;
-    }
-    
-    return part;
-  }).join("");
+  return terms
+    .map((t, i) => {
+      let part = "";
+      const absCoeff = Math.abs(t.coeff);
+
+      // Handle sign
+      if (i === 0) {
+        part += t.coeff < 0 ? "-" : "";
+      } else {
+        part += t.coeff < 0 ? " - " : " + ";
+      }
+
+      // Add coefficient (skip 1 if there's a variable)
+      if (!(absCoeff === 1 && (t.powA > 0 || t.powB > 0))) {
+        part += absCoeff;
+      }
+
+      // Add first variable
+      if (t.powA > 0) {
+        part += t.varA;
+        if (t.powA > 1) part += `^${t.powA}`;
+      }
+
+      // Add second variable
+      if (t.powB > 0) {
+        part += t.varB;
+        if (t.powB > 1) part += `^${t.powB}`;
+      }
+
+      // Handle case when both powers are 0 (constant term)
+      if (t.powA === 0 && t.powB === 0 && absCoeff === 1) {
+        part += "1";
+      }
+
+      return part;
+    })
+    .join("");
 }
 
 /* =========================
-   🚀 API ROUTES
+   🚀 ROUTES
 ========================= */
 
+// Root endpoint
 app.get("/", (req, res) => {
-  res.json({ 
+  res.json({
     message: "Pascal Triangle & Binomial Expansion API 🚀",
+    version: "2.0.0",
+    storage: useDatabase ? "database" : "memory",
     endpoints: {
-      pascal: "POST /api/pascal - Generate Pascal Triangle up to row n",
-      expand: "POST /api/expand - Expand binomial expression (ax^n + by^m)^p",
-      history: "GET /api/history - Get calculation history"
+      pascal: "POST /api/pascal - Body: { n: number }",
+      expand: "POST /api/expand - Body: { expression: string }",
+      history: "GET /api/history",
+      diagnostic: "GET /api/diagnostic",
+      health: "GET /api/health"
+    },
+    examples: {
+      pascal: { n: 5 },
+      expand: { expression: "(2x+3y)^4" }
     }
   });
+});
+
+// Health check
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    storage: useDatabase ? "database" : "memory",
+    uptime: process.uptime()
+  });
+});
+
+// Diagnostic endpoint
+app.get("/api/diagnostic", async (req, res) => {
+  const diagnostic = {
+    environment: {
+      node_version: process.version,
+      platform: process.platform,
+      node_env: process.env.NODE_ENV || "development",
+      port: process.env.PORT || 10000,
+      has_database_url: !!process.env.DATABASE_URL,
+      database_url_source: process.env.DATABASE_URL ? "configured" : "missing"
+    },
+    storage: {
+      type: useDatabase ? "postgresql" : "in-memory",
+      initialized: dbInitAttempted
+    },
+    database: {
+      connected: false,
+      table_exists: false,
+      error: null
+    },
+    memory_storage: {
+      entries_count: inMemoryHistory.length,
+      max_entries: 100
+    }
+  };
+  
+  // Test database if configured
+  if (pool && useDatabase) {
+    try {
+      const client = await pool.connect();
+      diagnostic.database.connected = true;
+      
+      // Check if table exists
+      const tableCheck = await client.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_name = 'history'
+        )
+      `);
+      diagnostic.database.table_exists = tableCheck.rows[0].exists;
+      
+      // Get count if table exists
+      if (diagnostic.database.table_exists) {
+        const countResult = await client.query('SELECT COUNT(*) FROM history');
+        diagnostic.database.record_count = parseInt(countResult.rows[0].count);
+      }
+      
+      client.release();
+    } catch (err) {
+      diagnostic.database.error = err.message;
+      diagnostic.database.connected = false;
+    }
+  }
+  
+  res.json(diagnostic);
 });
 
 // Pascal Triangle endpoint
@@ -225,33 +399,25 @@ app.post("/api/pascal", async (req, res) => {
       return res.status(400).json({ error: "Missing parameter: n" });
     }
     
-    const nInt = parseInt(n);
-    
-    if (isNaN(nInt)) {
-      return res.status(400).json({ error: "n must be a valid number" });
+    const numN = parseInt(n);
+    if (isNaN(numN) || numN < 0) {
+      return res.status(400).json({ error: "n must be a non-negative integer" });
     }
     
-    if (nInt < 0 || nInt > 100000) {
-      return res.status(400).json({ error: "n must be between 0 and 100,000" });
-    }
+    const rows = generatePascalTriangle(numN);
+    const result = { 
+      n: numN, 
+      rows,
+      timestamp: new Date().toISOString()
+    };
     
-    const rows = generatePascalTriangle(nInt);
+    // Save to history
+    await saveToHistory("pascal", `n=${numN}`, result);
     
-    res.json({
-      n: nInt,
-      rows: rows,
-      totalRows: rows.length
-    });
-    
-    // Store in history
-    await pool.query(
-      "INSERT INTO questions (question, answer) VALUES ($1, $2)",
-      [`Pascal Triangle n=${nInt}`, JSON.stringify({ n: nInt, totalRows: rows.length })]
-    );
-    
-  } catch (error) {
-    console.error("Pascal API Error:", error);
-    res.status(500).json({ error: error.message || "Internal server error" });
+    res.json(result);
+  } catch (err) {
+    console.error("Pascal error:", err);
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -267,76 +433,110 @@ app.post("/api/expand", async (req, res) => {
     const terms = expandBinomial(expression);
     const expanded = formatExpansion(terms);
     
-    const result = {
-      expression: expression,
-      expanded: expanded,
-      terms: terms,
-      power: terms.length > 0 ? terms[0].powA + terms[0].powB : 0
+    const result = { 
+      expression, 
+      expanded, 
+      terms,
+      timestamp: new Date().toISOString()
     };
     
+    // Save to history
+    await saveToHistory("expand", expression, result);
+    
     res.json(result);
-    
-    // Store in history
-    await pool.query(
-      "INSERT INTO questions (question, answer) VALUES ($1, $2)",
-      [`Expand: ${expression}`, JSON.stringify(result)]
-    );
-    
-  } catch (error) {
-    console.error("Expansion API Error:", error);
-    res.status(400).json({ error: error.message || "Invalid expression format" });
+  } catch (err) {
+    console.error("Expand error:", err);
+    res.status(400).json({ error: err.message });
   }
 });
 
-// Get history
+// History endpoint
 app.get("/api/history", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM questions ORDER BY id DESC LIMIT 50"
-    );
-    res.json(result.rows);
+    const limit = parseInt(req.query.limit) || 50;
+    const { success, storage, data } = await getHistory(limit);
+    
+    res.json({
+      success,
+      storage,
+      count: data.length,
+      data,
+      timestamp: new Date().toISOString()
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    console.error("History error:", err);
+    res.status(500).json({ 
+      error: "Failed to fetch history",
+      details: err.message 
+    });
   }
 });
 
-// Get specific history item
-app.get("/api/history/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(
-      "SELECT * FROM questions WHERE id = $1",
-      [id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "History item not found" });
-    }
-    
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Delete history
+// Clear history (for memory storage)
 app.delete("/api/history", async (req, res) => {
   try {
-    await pool.query("DELETE FROM questions");
-    res.json({ message: "History cleared successfully" });
+    if (useDatabase && pool) {
+      await pool.query("DELETE FROM history");
+      res.json({ success: true, message: "Database history cleared" });
+    } else {
+      inMemoryHistory = [];
+      res.json({ success: true, message: "Memory history cleared" });
+    }
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: err.message });
   }
+});
+
+// 404 handler for undefined routes
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: "Endpoint not found",
+    available_endpoints: [
+      "GET /",
+      "GET /api/health",
+      "GET /api/diagnostic",
+      "POST /api/pascal",
+      "POST /api/expand",
+      "GET /api/history",
+      "DELETE /api/history"
+    ]
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({ 
+    error: "Internal server error",
+    message: err.message 
+  });
 });
 
 /* =========================
-   🌐 SERVER START
+   🚀 SERVER STARTUP
 ========================= */
 const PORT = process.env.PORT || 10000;
 
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`
+║     PASCAL TRIANGLE & BINOMIAL API v2.0          ║
+
+║  🚀 Server running on port: ${PORT}                   
+║  💾 Storage mode: ${useDatabase ? "PostgreSQL" : "In-Memory"}         
+║  📍 Environment: ${process.env.NODE_ENV || "development"}           
+  `);
 });
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received, closing server...");
+  server.close(async () => {
+    if (pool) {
+      await pool.end();
+      console.log("Database pool closed");
+    }
+    process.exit(0);
+  });
+});
+
+export default app;
