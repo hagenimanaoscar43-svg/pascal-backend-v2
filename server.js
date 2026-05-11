@@ -25,7 +25,7 @@ app.use(
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-      console.log("❌ Blocked by CORS:", origin);
+      console.log(" Blocked by CORS:", origin);
       return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
@@ -33,14 +33,14 @@ app.use(
 );
 
 /* =========================
-   🔗 DATABASE CONNECTION
+   DATABASE CONNECTION
 ========================= */
 const { Pool } = pg;
 
 // Check if DATABASE_URL exists
 if (!process.env.DATABASE_URL) {
-  console.error("❌ WARNING: DATABASE_URL environment variable is missing");
-  console.log("📝 App will run with in-memory storage only");
+  console.error("WARNING: DATABASE_URL environment variable is missing");
+  console.log(" App will run with in-memory storage only");
 }
 
 const pool = process.env.DATABASE_URL ? new Pool({
@@ -59,11 +59,11 @@ let inMemoryHistory = [];
 let dbInitAttempted = false;
 
 /* =========================
-   📦 DATABASE INITIALIZATION
+   DATABASE INITIALIZATION
 ========================= */
 async function initDatabase() {
   if (!pool) {
-    console.log("📝 No database configured, using in-memory storage");
+    console.log(" No database configured, using in-memory storage");
     return false;
   }
 
@@ -74,7 +74,7 @@ async function initDatabase() {
     // Test connection
     const client = await pool.connect();
     await client.query('SELECT 1');
-    console.log("✅ Database connected successfully");
+    console.log(" Database connected successfully");
     
     // Create table if not exists
     await client.query(`
@@ -94,13 +94,13 @@ async function initDatabase() {
     `);
     
     client.release();
-    console.log("✅ History table ready");
+    console.log("History table ready");
     useDatabase = true;
     return true;
     
   } catch (err) {
-    console.error("❌ Database initialization failed:", err.message);
-    console.log("📝 Falling back to in-memory storage");
+    console.error(" Database initialization failed:", err.message);
+    console.log(" Falling back to in-memory storage");
     useDatabase = false;
     return false;
   }
@@ -116,10 +116,10 @@ async function saveToHistory(type, input, result) {
         "INSERT INTO history (type, input, result) VALUES ($1, $2, $3)",
         [type, input, JSON.stringify(result)]
       );
-      console.log(`✅ Saved to database: ${type}`);
+      console.log(` Saved to database: ${type}`);
       return true;
     } catch (dbError) {
-      console.error("❌ Database save failed:", dbError.message);
+      console.error(" Database save failed:", dbError.message);
       useDatabase = false;
       // Fall through to memory
     }
@@ -141,7 +141,7 @@ async function saveToHistory(type, input, result) {
     inMemoryHistory = inMemoryHistory.slice(0, 100);
   }
   
-  console.log(`💾 Saved to memory: ${type}`);
+  console.log(` Saved to memory: ${type}`);
   return true;
 }
 
@@ -154,7 +154,7 @@ async function getHistory(limit = 50) {
       );
       return { success: true, storage: "database", data: result.rows };
     } catch (dbError) {
-      console.error("❌ Database read failed:", dbError.message);
+      console.error(" Database read failed:", dbError.message);
       useDatabase = false;
       // Fall through to memory
     }
